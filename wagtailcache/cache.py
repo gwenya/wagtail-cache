@@ -4,6 +4,7 @@ Functionality to set, serve from, and clear the cache.
 
 import logging
 import re
+import time
 from enum import Enum
 from functools import wraps
 from typing import Callable
@@ -27,6 +28,7 @@ from django.utils.cache import patch_response_headers
 from django.utils.cache import set_response_etag
 from django.utils.deprecation import MiddlewareMixin
 from django.utils.http import parse_etags
+from django.utils.http import parse_http_date
 from wagtail import hooks
 
 from wagtailcache.settings import wagtailcache_settings
@@ -246,7 +248,6 @@ class FetchFromCacheMiddleware(MiddlewareMixin):
             not_modified = HttpResponse(status=304)
             not_modified.headers["Etag"] = response.headers["Etag"]
             not_modified.headers["Cache-Control"] = response.headers["Cache-Control"]
-            not_modified.headers["Expires"] = response.headers["Expires"]
             return not_modified
         return response
 
@@ -293,6 +294,11 @@ class UpdateCacheMiddleware(MiddlewareMixin):
             _patch_header(response, Status.HIT)
             # Potentially remove the ``Vary: Cookie`` header.
             _chop_response_vary(request, response)
+            # patch the Expires header
+            max_age = get_max_age(response)
+            del response["Expires"]
+            if max_age is not None:
+                patch_response_headers(response, max_age)
             # We don't need to update the cache, just return.
             return response
         # Check if the response is cacheable
