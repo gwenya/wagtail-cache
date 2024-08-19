@@ -187,69 +187,73 @@ class FetchFromCacheMiddleware(MiddlewareMixin):
     Mostly stolen from ``django.middleware.cache.FetchFromCacheMiddleware``.
     """
 
-    def __init__(self, get_response=None):
+    def __init__(self, get_response):
+        super().__init__(get_response)
         self._wagcache = caches[wagtailcache_settings.WAGTAIL_CACHE_BACKEND]
-        self.get_response = get_response
-        self._async_check()
 
     def process_request(self, request: WSGIRequest) -> Optional[HttpResponse]:
-        if not wagtailcache_settings.WAGTAIL_CACHE:
-            return None
-        # Check if request is cacheable
-        # Only cache GET and HEAD requests.
-        # Don't cache requests that are previews.
-        # Don't cache requests that have a logged in user.
-        # NOTE: Wagtail manually adds `is_preview` to the request object.
-        #       This is not normally part of a request object.
-        is_cacheable = (
-            request.method in ("GET", "HEAD")
-            and not getattr(request, "is_preview", False)
-            and not (hasattr(request, "user") and request.user.is_authenticated)
-        )
-        # Allow the user to override our caching decision.
-        for fn in hooks.get_hooks("is_request_cacheable"):
-            result = fn(request, is_cacheable)
-            if isinstance(result, bool):
-                is_cacheable = result
+        return process_fetch(request, self._wagcache)
 
-        if not is_cacheable:
-            setattr(request, "_wagtailcache_update", False)
-            setattr(request, "_wagtailcache_skip", True)
-            return None  # Don't bother checking the cache.
-        # Try and get the cached response.
-        try:
-            cache_key = _get_cache_key(request, self._wagcache)
-            # No cache information available, need to rebuild.
-            if cache_key is None:
-                setattr(request, "_wagtailcache_update", True)
-                return None
-            # We have a key, get the cached response.
-            response: HttpResponse = self._wagcache.get(cache_key)
 
-        except Exception:
-            # If the cache backend is currently unresponsive or errors out,
-            # return None and log the error.
-            setattr(request, "_wagtailcache_error", True)
-            logger.exception("Could not fetch page from cache backend.")
-            return None
+def process_fetch(request: WSGIRequest, cache) -> Optional[HttpResponse]:
+    if not wagtailcache_settings.WAGTAIL_CACHE:
+        return None
+    # Check if request is cacheable
+    # Only cache GET and HEAD requests.
+    # Don't cache requests that are previews.
+    # Don't cache requests that have a logged in user.
+    # NOTE: Wagtail manually adds `is_preview` to the request object.
+    #       This is not normally part of a request object.
+    is_cacheable = (
+        request.method in ("GET", "HEAD")
+        and not getattr(request, "is_preview", False)
+        and not (hasattr(request, "user") and request.user.is_authenticated)
+    )
+    # Allow the user to override our caching decision.
+    for fn in hooks.get_hooks("is_request_cacheable"):
+        result = fn(request, is_cacheable)
+        if isinstance(result, bool):
+            is_cacheable = result
+
+    if not is_cacheable:
+        setattr(request, "_wagtailcache_update", False)
+        setattr(request, "_wagtailcache_skip", True)
+        return None  # Don't bother checking the cache.
+    # Try and get the cached response.
+    try:
+        cache_key = _get_cache_key(request, cache)
         # No cache information available, need to rebuild.
-        if response is None:
+        if cache_key is None:
             setattr(request, "_wagtailcache_update", True)
             return None
-        # Hit. Return cached response or Not Modified.
-        setattr(request, "_wagtailcache_update", False)
-        if (
-            wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS
-            and "If-None-Match" in request.headers
-            and "Etag" in response.headers
-            and response.headers["Etag"]
-            in parse_etags(request.headers["If-None-Match"])
-        ):
-            not_modified = HttpResponse(status=304)
-            not_modified.headers["Etag"] = response.headers["Etag"]
-            not_modified.headers["Cache-Control"] = response.headers["Cache-Control"]
-            return not_modified
-        return response
+        # We have a key, get the cached response.
+        response: HttpResponse = cache.get(cache_key)
+
+    except Exception:
+        # If the cache backend is currently unresponsive or errors out,
+        # return None and log the error.
+        setattr(request, "_wagtailcache_error", True)
+        logger.exception("Could not fetch page from cache backend.")
+        return None
+    # No cache information available, need to rebuild.
+    if response is None:
+        setattr(request, "_wagtailcache_update", True)
+        return None
+    # Hit. Return cached response or Not Modified.
+    setattr(request, "_wagtailcache_update", False)
+    if (
+        wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS
+        and "If-None-Match" in request.headers
+        and "Etag" in response.headers
+        and response.headers["Etag"]
+        in parse_etags(request.headers["If-None-Match"])
+    ):
+        not_modified = HttpResponse(status=304)
+        not_modified.headers["Etag"] = response.headers["Etag"]
+        not_modified.headers["Cache-Control"] = response.headers[
+            "Cache-Control"]
+        return not_modified
+    return response
 
 
 class UpdateCacheMiddleware(MiddlewareMixin):
@@ -258,138 +262,141 @@ class UpdateCacheMiddleware(MiddlewareMixin):
     Mostly stolen from ``django.middleware.cache.UpdateCacheMiddleware``.
     """
 
-    def __init__(self, get_response=None):
+    def __init__(self, get_response):
+        super().__init__(get_response)
         self._wagcache = caches[wagtailcache_settings.WAGTAIL_CACHE_BACKEND]
-        self.get_response = get_response
-        self._async_check()
 
     def process_response(
         self, request: WSGIRequest, response: HttpResponse
     ) -> HttpResponse:
-        if not wagtailcache_settings.WAGTAIL_CACHE:
-            return response
+        return process_update(request, response, self._wagcache)
 
-        if (
-            hasattr(request, "_wagtailcache_skip")
-            and request._wagtailcache_skip
-        ):
-            # If we should skip this response, add header and return.
-            _patch_header(response, Status.SKIP)
-            return response
 
-        if (
-            hasattr(request, "_wagtailcache_error")
-            and request._wagtailcache_error
-        ):
-            # There was an error trying to fetch this response from the cache.
-            # Do not try to update, simply return.
-            _patch_header(response, Status.ERROR)
-            return response
-
-        if (
-            hasattr(request, "_wagtailcache_update")
-            and not request._wagtailcache_update
-        ):
-            # Add a response header to indicate this was a cache hit.
-            _patch_header(response, Status.HIT)
-            # Potentially remove the ``Vary: Cookie`` header.
-            _chop_response_vary(request, response)
-            # patch the Expires header
-            max_age = get_max_age(response)
-            del response["Expires"]
-            if max_age is not None:
-                patch_response_headers(response, max_age)
-            # We don't need to update the cache, just return.
-            return response
-        # Check if the response is cacheable
-        # Don't cache private or no-cache responses.
-        # Do cache 200, 301, 302, 304, and 404 codes so that wagtail doesn't
-        #   have to repeatedly look up these URLs in the database.
-        # Don't cache streaming responses.
-        # Don't cache responses that set a user-specific cookie in response
-        #   to a cookie-less request (e.g. CSRF tokens).
-        is_cacheable = (
-            CacheControl.NOCACHE.value not in response.get("Cache-Control", "")
-            and CacheControl.PRIVATE.value
-            not in response.get("Cache-Control", "")
-            and response.status_code in (200, 301, 302, 304, 404)
-            and not response.streaming
-            and not (
-            not request.COOKIES
-            and response.cookies
-            and has_vary_header(response, "Cookie")
-        )
-        )
-        # Allow the user to override our caching decision.
-        for fn in hooks.get_hooks("is_response_cacheable"):
-            result = fn(response, is_cacheable)
-            if isinstance(result, bool):
-                is_cacheable = result
-        # If we are not allowed to cache the response, just return.
-        if not is_cacheable:
-            # Add response header to indicate this was intentionally not cached.
-            _patch_header(response, Status.SKIP)
-            return response
-        # Potentially remove the ``Vary: Cookie`` header.
-        _chop_response_vary(request, response)
-        # Try to get the timeout from the ``max-age`` section of the
-        # ``Cache-Control`` header before reverting to using the cache's
-        # default.
-        timeout = get_max_age(response)
-        max_age = timeout
-        if timeout is None:
-            timeout = self._wagcache.default_timeout
-            max_age = wagtailcache_settings.WAGTAIL_CACHE_MAX_AGE
-        if max_age is None:
-            patch_cache_control(response, no_cache=True)
-        else:
-            patch_response_headers(response, max_age)
-            if wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS:
-                patch_cache_control(response, must_revalidate=True)
-
-        if timeout != 0:
-            try:
-                cache_key = _learn_cache_key(
-                    request, response, timeout, self._wagcache
-                )
-                # Track cache keys based on URI.
-                # (of the chopped request, not the real one).
-                cr = _chop_querystring(request)
-                uri = unquote(cr.build_absolute_uri())
-                keyring = self._wagcache.get("keyring", {})
-                # Get current cache keys belonging to this URI.
-                # This should be a list of keys.
-                uri_keys: List[str] = keyring.get(uri, [])
-                # Append the key to this list if not already present and save.
-                if cache_key not in uri_keys:
-                    uri_keys.append(cache_key)
-                    keyring[uri] = uri_keys
-                    self._wagcache.set("keyring", keyring)
-
-                def set_etag(r):
-                    if wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS and "Etag" not in r.headers:
-                        set_response_etag(r)
-
-                if isinstance(response, SimpleTemplateResponse):
-
-                    def callback(r):
-                        set_etag(response)
-                        self._wagcache.set(cache_key, r, timeout)
-
-                    response.add_post_render_callback(callback)
-                else:
-                    set_etag(response)
-                    self._wagcache.set(cache_key, response, timeout)
-                # Add a response header to indicate this was a cache miss.
-                _patch_header(response, Status.MISS)
-            except Exception:
-                _patch_header(response, Status.ERROR)
-                logger.exception("Could not update page in cache backend.")
-
+def process_update(request: WSGIRequest, response: HttpResponse, cache):
+    if not wagtailcache_settings.WAGTAIL_CACHE:
         return response
 
+    if (
+        hasattr(request, "_wagtailcache_skip")
+        and request._wagtailcache_skip
+    ):
+        # If we should skip this response, add header and return.
+        _patch_header(response, Status.SKIP)
+        return response
 
-def clear_cache(urls: List[str] = []) -> None:
+    if (
+        hasattr(request, "_wagtailcache_error")
+        and request._wagtailcache_error
+    ):
+        # There was an error trying to fetch this response from the cache.
+        # Do not try to update, simply return.
+        _patch_header(response, Status.ERROR)
+        return response
+
+    if (
+        hasattr(request, "_wagtailcache_update")
+        and not request._wagtailcache_update
+    ):
+        # Add a response header to indicate this was a cache hit.
+        _patch_header(response, Status.HIT)
+        # Potentially remove the ``Vary: Cookie`` header.
+        _chop_response_vary(request, response)
+        # patch the Expires header
+        max_age = get_max_age(response)
+        del response["Expires"]
+        if max_age is not None:
+            patch_response_headers(response, max_age)
+        # We don't need to update the cache, just return.
+        return response
+    # Check if the response is cacheable
+    # Don't cache private or no-cache responses.
+    # Do cache 200, 301, 302, 304, and 404 codes so that wagtail doesn't
+    #   have to repeatedly look up these URLs in the database.
+    # Don't cache streaming responses.
+    # Don't cache responses that set a user-specific cookie in response
+    #   to a cookie-less request (e.g. CSRF tokens).
+    is_cacheable = (
+        CacheControl.NOCACHE.value not in response.get("Cache-Control", "")
+        and CacheControl.PRIVATE.value
+        not in response.get("Cache-Control", "")
+        and response.status_code in (200, 301, 302, 304, 404)
+        and not response.streaming
+        and not (
+        not request.COOKIES
+        and response.cookies
+        and has_vary_header(response, "Cookie")
+    )
+    )
+    # Allow the user to override our caching decision.
+    for fn in hooks.get_hooks("is_response_cacheable"):
+        result = fn(response, is_cacheable)
+        if isinstance(result, bool):
+            is_cacheable = result
+    # If we are not allowed to cache the response, just return.
+    if not is_cacheable:
+        # Add response header to indicate this was intentionally not cached.
+        _patch_header(response, Status.SKIP)
+        return response
+    # Potentially remove the ``Vary: Cookie`` header.
+    _chop_response_vary(request, response)
+    # Try to get the timeout from the ``max-age`` section of the
+    # ``Cache-Control`` header before reverting to using the cache's
+    # default.
+    timeout = get_max_age(response)
+    max_age = timeout
+    if timeout is None:
+        timeout = cache.default_timeout
+        max_age = wagtailcache_settings.WAGTAIL_CACHE_MAX_AGE
+    if max_age is None:
+        patch_cache_control(response, no_cache=True)
+    else:
+        patch_response_headers(response, max_age)
+        if wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS:
+            patch_cache_control(response, must_revalidate=True)
+
+    if timeout != 0:
+        try:
+            cache_key = _learn_cache_key(
+                request, response, timeout, cache
+            )
+            # Track cache keys based on URI.
+            # (of the chopped request, not the real one).
+            cr = _chop_querystring(request)
+            uri = unquote(cr.build_absolute_uri())
+            keyring = cache.get("keyring", {})
+            # Get current cache keys belonging to this URI.
+            # This should be a list of keys.
+            uri_keys: List[str] = keyring.get(uri, [])
+            # Append the key to this list if not already present and save.
+            if cache_key not in uri_keys:
+                uri_keys.append(cache_key)
+                keyring[uri] = uri_keys
+                cache.set("keyring", keyring)
+
+            def set_etag(r):
+                if wagtailcache_settings.WAGTAIL_CACHE_USE_ETAGS and "Etag" not in r.headers:
+                    set_response_etag(r)
+
+            if isinstance(response, SimpleTemplateResponse):
+
+                def callback(r):
+                    set_etag(response)
+                    cache.set(cache_key, r, timeout)
+
+                response.add_post_render_callback(callback)
+            else:
+                set_etag(response)
+                cache.set(cache_key, response, timeout)
+            # Add a response header to indicate this was a cache miss.
+            _patch_header(response, Status.MISS)
+        except Exception:
+            _patch_header(response, Status.ERROR)
+            logger.exception("Could not update page in cache backend.")
+
+    return response
+
+
+def clear_cache(urls: List[str] = None) -> None:
     """
     Clears the Wagtail cache backend.
 
@@ -430,17 +437,19 @@ def cache_page(view_func: Callable[..., HttpResponse]):
     page.
     """
 
+    wagcache = caches[wagtailcache_settings.WAGTAIL_CACHE_BACKEND]
+
     @wraps(view_func)
     def _wrapped_view_func(
         request: WSGIRequest, *args, **kwargs
     ) -> HttpResponse:
         # Try to fetch an already cached page from wagtail-cache.
-        response = FetchFromCacheMiddleware().process_request(request)
+        response = process_fetch(request, wagcache)
         if response is None:
             # Since we don't have a response at this point, process the request.
             response = view_func(request, *args, **kwargs)
         # Cache the response.
-        response = UpdateCacheMiddleware().process_response(request, response)
+        response = process_update(request, response, wagcache)
         return response
 
     return _wrapped_view_func
