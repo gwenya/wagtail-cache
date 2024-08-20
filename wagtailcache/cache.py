@@ -272,7 +272,7 @@ class UpdateCacheMiddleware(MiddlewareMixin):
         return process_update(request, response, self._wagcache)
 
 
-def process_update(request: WSGIRequest, response: HttpResponse, cache):
+def process_update(request: WSGIRequest, response: HttpResponse, cache) -> HttpResponse:
     if not wagtailcache_settings.WAGTAIL_CACHE:
         return response
 
